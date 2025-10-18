@@ -129,7 +129,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             client = AzureOpenAI(**self._to_credential_kwargs(credentials))
             if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
                 client.chat.completions.create(
-                    messages=[{"role": "user", "content": "ping"}],
+                    input=[{"role": "user", "content": "ping"}],
                     model=model,
                     temperature=1,
                     max_completion_tokens=20,
@@ -351,13 +351,23 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                 del extra_model_kwargs["stop"]
 
         messages: Any = [self._convert_prompt_message_to_dict(m) for m in prompt_messages]
-        response = client.chat.completions.create(
-            messages=messages,
-            model=model,
-            stream=stream,
-            **model_parameters,
-            **extra_model_kwargs,
-        )
+        if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
+            # Responses API expects 'input' instead of 'messages' for thinking-series models.
+            response = client.chat.completions.create(
+                input=messages,
+                model=model,
+                stream=stream,
+                **model_parameters,
+                **extra_model_kwargs,
+            )
+        else:
+            response = client.chat.completions.create(
+                messages=messages,
+                model=model,
+                stream=stream,
+                **model_parameters,
+                **extra_model_kwargs,
+            )
 
         if stream:
             return self._handle_chat_generate_stream_response(
