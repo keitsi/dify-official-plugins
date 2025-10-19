@@ -128,11 +128,9 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         try:
             client = AzureOpenAI(**self._to_credential_kwargs(credentials))
             if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
-                client.chat.completions.create(
-                    input=[{"role": "user", "content": "ping"}],
+                client.responses.create(
+                    input="ping",
                     model=model,
-                    temperature=1,
-                    max_completion_tokens=20,
                     stream=False,
                 )
             elif (
@@ -324,15 +322,32 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             del model_parameters["json_schema"]
         extra_model_kwargs = {}
         if tools:
-            extra_model_kwargs["tools"] = [
-                PromptMessageFunction(function=tool).model_dump(mode="json")
-                for tool in tools
-            ]
+            if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
+                # extra_model_kwargs["tools"]=[
+                #     {
+                #         "name": "current_time",
+                #         "description": "A tool for getting the current time.",
+                #         "type": "custom",
+                #     }
+                # ]
+                extra_model_kwargs["tools"]=[
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "type": "custom",
+                    }
+                    for tool in tools
+                ]
+            else:
+                extra_model_kwargs["tools"] = [
+                    PromptMessageFunction(function=tool).model_dump(mode="json")
+                    for tool in tools
+                ]
         if stop:
             extra_model_kwargs["stop"] = stop
         if user:
             extra_model_kwargs["user"] = user
-        if stream:
+        if stream and not base_model_name.startswith(THINKING_SERIES_COMPATIBILITY): # thinking-series does not support usage in streaming
             extra_model_kwargs["stream_options"] = {"include_usage": True}
         prompt_messages = self._clear_illegal_prompt_messages(
             base_model_name, prompt_messages
@@ -353,7 +368,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         messages: Any = [self._convert_prompt_message_to_dict(m) for m in prompt_messages]
         if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
             # Responses API expects 'input' instead of 'messages' for thinking-series models.
-            response = client.chat.completions.create(
+            response = client.responses.create(
                 input=messages,
                 model=model,
                 stream=stream,
@@ -370,6 +385,10 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             )
 
         if stream:
+            if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
+                return self._handle_thinking_model_stream_response(
+                    model, credentials, response, prompt_messages, tools
+                )
             return self._handle_chat_generate_stream_response(
                 model, credentials, response, prompt_messages, tools
             )
@@ -572,6 +591,238 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             model, credentials, prompt_tokens, completion_tokens
         )
 
+        yield LLMResultChunk(
+            model=real_model,
+            prompt_messages=prompt_messages,
+            system_fingerprint=system_fingerprint,
+            delta=LLMResultChunkDelta(
+                index=index,
+                message=AssistantPromptMessage(content=""),
+                finish_reason="stop",
+                usage=usage,
+            ),
+        )
+
+    def _handle_thinking_model_stream_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: Stream[ChatCompletionChunk],
+        prompt_messages: list[PromptMessage],
+        tools: Optional[list[PromptMessageTool]] = None,
+    ):
+        is_reasoning = False
+        index = 0
+        real_model = model
+        system_fingerprint = None
+        completion = ""
+        tool_calls = []
+        prompt_tokens = 0
+        completion_tokens = 0
+        has_usage = False
+
+        for chunk in response:
+            if hasattr(chunk, "usage") and chunk.usage:
+                try:
+                    prompt_tokens = getattr(chunk.usage, "input_tokens")
+                except Exception:
+                    prompt_tokens = getattr(chunk.usage, "prompt_tokens", prompt_tokens)
+                try:
+                    completion_tokens = getattr(chunk.usage, "output_tokens")
+                except Exception:
+                    completion_tokens = getattr(chunk.usage, "completion_tokens", completion_tokens)
+                has_usage = True
+            if chunk.type == 'response.output_text.delta':
+                if chunk.delta is None:
+                    continue
+                assistant_prompt_message = AssistantPromptMessage(
+                    content=chunk.delta, tool_calls=tool_calls
+                )
+                completion += chunk.delta
+                yield LLMResultChunk(
+                    model=real_model,
+                    prompt_messages=prompt_messages,
+                    delta=LLMResultChunkDelta(
+                        index=index, message=assistant_prompt_message
+                    ),
+                )
+                index += 1
+        if not has_usage:
+            prompt_tokens = self._num_tokens_from_messages(
+                credentials, prompt_messages, tools
+            )
+            full_assistant_prompt_message = AssistantPromptMessage(content=completion)
+            completion_tokens = self._num_tokens_from_messages(
+                credentials, [full_assistant_prompt_message]
+            )
+        usage = self._calc_response_usage(
+            model, credentials, prompt_tokens, completion_tokens
+        )
+
+        yield LLMResultChunk(
+            model=real_model,
+            prompt_messages=prompt_messages,
+            system_fingerprint=system_fingerprint,
+            delta=LLMResultChunkDelta(
+                index=index,
+                message=AssistantPromptMessage(content=""),
+                finish_reason="stop",
+                usage=usage,
+            ),
+        )
+    def _handle_thinking_model_stream_responsex(
+        self,
+        model: str,
+        credentials: dict,
+        response: Stream,
+        prompt_messages: list[PromptMessage],
+        tools: Optional[list[PromptMessageTool]] = None,
+    ):
+        is_reasoning = False
+        index = 0
+        real_model = model
+        system_fingerprint = None
+        completion = ""
+        tool_calls: list[AssistantPromptMessage.ToolCall] = []
+        prompt_tokens = 0
+        completion_tokens = 0
+        has_usage = False
+
+        assistant_prompt_message = AssistantPromptMessage(
+            content="test", tool_calls=tool_calls
+        )
+        yield LLMResultChunk(
+            model=real_model,
+            prompt_messages="test",
+            system_fingerprint="test",
+            delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+        )
+        for chunk in response:
+            if chunk.type == 'response.output_text.delta':
+                print(chunk.delta, end='')
+            # detect and record usage if present on the chunk
+            if hasattr(chunk, "usage") and chunk.usage:
+                # Responses usage fields may be named input_tokens/output_tokens
+                try:
+                    prompt_tokens = getattr(chunk.usage, "input_tokens")
+                except Exception:
+                    prompt_tokens = getattr(chunk.usage, "prompt_tokens", prompt_tokens)
+                try:
+                    completion_tokens = getattr(chunk.usage, "output_tokens")
+                except Exception:
+                    completion_tokens = getattr(chunk.usage, "completion_tokens", completion_tokens)
+                has_usage = True
+
+            # 1) Handle legacy chat-style streaming (choices)
+            if hasattr(chunk, "choices") and getattr(chunk, "choices"):
+                delta = chunk.choices[0]
+                if delta.delta is None:
+                    continue
+
+                # update tool calls from choice deltas
+                self._update_tool_calls(
+                    tool_calls=tool_calls, tool_calls_response=delta.delta.tool_calls
+                )
+
+                # skip empty increments
+                if (
+                    delta.finish_reason is None
+                    and not delta.delta.content
+                    and not hasattr(delta.delta, "reasoning_content")
+                ):
+                    continue
+
+                # use existing reasoning wrapping if available
+                content, is_reasoning = self._azure_wrap_thinking_by_reasoning_content(
+                    delta.delta, is_reasoning
+                )
+
+                assistant_prompt_message = AssistantPromptMessage(
+                    content=content, tool_calls=tool_calls
+                )
+                real_model = getattr(chunk, "model", real_model)
+                system_fingerprint = getattr(chunk, "system_fingerprint", system_fingerprint)
+                completion += content
+
+                yield LLMResultChunk(
+                    model=real_model,
+                    prompt_messages=prompt_messages,
+                    system_fingerprint=system_fingerprint,
+                    delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                )
+                index += 1
+                continue
+
+            # 2) Handle Responses-style streaming (no .choices, has .output)
+            if hasattr(chunk, "output") and chunk.output:
+                assistant_prompt_message = AssistantPromptMessage(
+                    content="test2", tool_calls=tool_calls
+                )
+                yield LLMResultChunk(
+                    model=real_model,
+                    prompt_messages="test",
+                    system_fingerprint="test",
+                    delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                )
+                assistant_prompt_message = AssistantPromptMessage(
+                    content=json.dumps(chunk, indent=2), tool_calls=tool_calls
+                )
+                yield LLMResultChunk(
+                    model=real_model,
+                    prompt_messages="test",
+                    system_fingerprint="test",
+                    delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                )
+                # update tool calls from choice deltas
+                self._update_tool_calls(
+                    tool_calls=tool_calls, tool_calls_response=chunk.tool_choice
+                )
+                outputs = chunk.output
+                # outputs is expected to be a list of message objects
+                for out in outputs:
+                    # out may be a dict-like object or SDK object; try attribute then mapping
+                    content_list = out.content
+                    if not content_list:
+                        continue
+
+                    for item in content_list:
+                        # item may be object with .type/.text or a dict
+                        item_type = item.type
+                        item_text = item.text
+
+                        if item_type == "output_text" and item_text:
+                            # Direct text chunk from Responses API
+                            content = item_text
+
+                            assistant_prompt_message = AssistantPromptMessage(
+                                content=content, tool_calls=tool_calls
+                            )
+                            real_model = chunk.model
+                            completion += content
+
+                            yield LLMResultChunk(
+                                model=real_model,
+                                prompt_messages=prompt_messages,
+                                delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                            )
+                            index += 1
+
+                        # You may encounter other item types (annotations, structured outputs)
+                        # Add handling here as needed.
+                continue
+
+            # if neither choices nor output exist, skip
+            continue
+
+        # compute usage when not provided on stream
+        if not has_usage:
+            prompt_tokens = self._num_tokens_from_messages(credentials, prompt_messages, tools)
+            full_assistant_prompt_message = AssistantPromptMessage(content=completion)
+            completion_tokens = self._num_tokens_from_messages(credentials, [full_assistant_prompt_message])
+
+        usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+
+        # final stop chunk
         yield LLMResultChunk(
             model=real_model,
             prompt_messages=prompt_messages,
