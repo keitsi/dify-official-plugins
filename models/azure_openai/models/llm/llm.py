@@ -323,14 +323,15 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
         extra_model_kwargs = {}
         if tools:
             if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
-                extra_model_kwargs["tools"]=[
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "type": "custom",
-                    }
-                    for tool in tools
-                ]
+                extra_model_kwargs["tools"] = []
+                for tool in tools:
+                    curr_tool = PromptMessageFunction(function=tool).model_dump(mode="json")
+                    extra_model_kwargs["tools"].append({
+                        "type": "function",
+                        "name": curr_tool["function"]["name"],
+                        "description": curr_tool["function"]["description"],
+                        "parameters": curr_tool["function"]["parameters"],
+                    })
             else:
                 extra_model_kwargs["tools"] = [
                     PromptMessageFunction(function=tool).model_dump(mode="json")
@@ -358,12 +359,13 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             if "stop" in extra_model_kwargs:
                 del extra_model_kwargs["stop"]
 
-        messages: Any = [self._convert_prompt_message_to_dict(m) for m in prompt_messages]
+        messages: Any = [self._convert_prompt_message_to_dict(m, base_model_name.startswith(THINKING_SERIES_COMPATIBILITY)) for m in prompt_messages]
         if base_model_name.startswith(THINKING_SERIES_COMPATIBILITY):
             # Responses API expects 'input' instead of 'messages' for thinking-series models.
             reasoning_effort = 'low'
             if 'reasoning_effort' in model_parameters:
                 reasoning_effort = model_parameters.pop("reasoning_effort")
+
             response = client.responses.create(
                 input=messages,
                 model=model,
@@ -660,6 +662,8 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                     ),
                 )
                 index += 1
+            elif event.type == 'response.output_text.done':
+                continue
             elif event.type == 'response.reasoning_summary_text.delta':
                 if event.delta is None:
                     continue
@@ -690,6 +694,54 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                         ),
                     )
                     index += 1
+            elif event.type == 'response.output_item.added':
+                if getattr(event.item, 'type', None) == 'function_call':
+                    if is_reasoning:
+                        is_reasoning = False
+                        assistant_prompt_message = AssistantPromptMessage(
+                            content='\n</think>\n', tool_calls=tool_calls
+                        )
+                        completion += '\n</think>\n'
+                        yield LLMResultChunk(
+                            model=real_model,
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(
+                                index=index, message=assistant_prompt_message
+                            ),
+                        )
+                        index += 1
+                    function = AssistantPromptMessage.ToolCall.ToolCallFunction(
+                        name=event.item.name,
+                        arguments='',
+                    )
+                    tool_call = AssistantPromptMessage.ToolCall(
+                        id=event.item.id,
+                        type='function',
+                        function=function,
+                    )
+                    tool_calls.append(tool_call)
+                    continue
+            elif event.type == 'response.function_call_arguments.delta':
+                delta_id = event.item_id
+                delta_str = event.delta or ""
+                for tc in tool_calls:
+                    if tc.id == delta_id:
+                        tc.function.arguments += delta_str
+                continue
+            elif event.type == 'response.function_call_arguments.done':
+                assistant_prompt_message = AssistantPromptMessage(
+                    content='', tool_calls=tool_calls
+                )
+                completion += ''
+                yield LLMResultChunk(
+                    model=real_model,
+                    prompt_messages=prompt_messages,
+                    delta=LLMResultChunkDelta(
+                        index=index, message=assistant_prompt_message
+                    ),
+                )
+                index += 1
+                continue
         if is_reasoning:
             assistant_prompt_message = AssistantPromptMessage(
                 content='\n</think>\n', tool_calls=tool_calls
@@ -782,7 +834,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                         tool_calls.append(tool_call)
 
     @staticmethod
-    def _convert_prompt_message_to_dict(message: PromptMessage):
+    def _convert_prompt_message_to_dict(message: PromptMessage, is_think_model: bool= False):
         if isinstance(message, UserPromptMessage):
             message = cast(UserPromptMessage, message)
             if isinstance(message.content, str):
@@ -827,7 +879,7 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
                 message_dict = {"role": "user", "content": sub_messages}
         elif isinstance(message, AssistantPromptMessage):
             message_dict = {"role": "assistant", "content": message.content}
-            if message.tool_calls:
+            if (not is_think_model) and message.tool_calls:
                 message_dict["tool_calls"] = [
                     tool_call.model_dump(mode="json")
                     for tool_call in message.tool_calls
@@ -837,15 +889,21 @@ class AzureOpenAILargeLanguageModel(_CommonAzureOpenAI, LargeLanguageModel):
             message_dict = {"role": "system", "content": message.content}
         elif isinstance(message, ToolPromptMessage):
             message = cast(ToolPromptMessage, message)
-            message_dict = {
-                "role": "tool",
-                "name": message.name,
-                "content": message.content,
-                "tool_call_id": message.tool_call_id,
-            }
+            if is_think_model:
+                message_dict = {
+                    "role": "assistant",
+                    "content": f"Tool name: {message.name}. Tool content:{message.content}"
+                }
+            else:
+                message_dict = {
+                    "role": "tool",
+                    "name": message.name,
+                    "content": message.content,
+                    "tool_call_id": message.tool_call_id,
+                }
         else:
             raise ValueError(f"Got unknown type {message}")
-        if message.name:
+        if (not is_think_model) and message.name:
             message_dict["name"] = message.name
         return message_dict
 
